@@ -1,0 +1,10 @@
+training_data/
+urlbert_classifier/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/
+logs/
+models/
+outputs/
