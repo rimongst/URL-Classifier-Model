@@ -14,6 +14,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 import re
 
+
 class URLDataCollector:
     """核心类"""
     
@@ -97,11 +98,7 @@ class URLDataCollector:
         path = urlparse(url).path.lower()
         
         blacklist = [
-            '/cart', '/checkout', '/account', '/login', '/signup', '/register',
-            '/privacy', '/terms', '/cookie', '/cookies', '/legal', '/gdpr',
-            '/faq', '/help', '/support', '/contact', '/contacts', '/customer',
-            '/refund', '/returns', '/shipping', '/delivery', '/track-order',
-            '/sso', '/oauth', '/api', '/graphql', '/wp-json', '/wp-admin',
+            '/cart', '/sso', '/oauth', '/api', '/graphql', '/wp-json', '/wp-admin',
             '/sitemap', '/feed', '/xmlrpc', '/basket', '/panier', '/commande'
         ]
         for b in blacklist:
