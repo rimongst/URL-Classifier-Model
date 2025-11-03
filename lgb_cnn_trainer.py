@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-LightGBM + CNN - 小数据集优化版本
-针对<500样本的场景优化
+LightGBM + CNN 
 """
 import json
 import pickle
