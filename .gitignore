@@ -1,4 +1,5 @@
 training_data/
+NLP/
 urlbert_classifier/
 .venv/
 __pycache__/
