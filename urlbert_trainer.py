@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-URLBERT URL Classifier
+URLBERT URL Classifier - Stacking Ensemble Version
 """
 
 import json
@@ -31,6 +31,7 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import f1_score, accuracy_score
 from sklearn.model_selection import GroupKFold
 from sklearn.decomposition import TruncatedSVD
+from sklearn.linear_model import LogisticRegression
 
 # Tree models
 try:
@@ -67,7 +68,7 @@ class ModelConfig:
     # URLBERT parameters
     urlbert_model_name: str = "CrabInHoney/urlbert-tiny-base-v4"
     urlbert_device: Optional[str] = None
-    urlbert_max_length: int = 128
+    urlbert_max_length: int = 64  # Changed from 128 to 64 to match model's buffer
     urlbert_batch_size: int = 64
     urlbert_use_mean_pooling: bool = True
     urlbert_extract_layers: Optional[List[int]] = None
@@ -97,6 +98,10 @@ class ModelConfig:
     xgb_max_depth: int = 7
     xgb_subsample: float = 0.85
     xgb_colsample_bytree: float = 0.85
+    
+    # Meta-model parameters for Stacking
+    meta_C: float = 1.0
+    meta_max_iter: int = 1000
     
     # Data processing
     remove_duplicates: bool = True
@@ -228,6 +233,13 @@ class FeatureExtractor:
         self.tokenizer = AutoTokenizer.from_pretrained(config.urlbert_model_name, use_fast=False)
         self.model = AutoModel.from_pretrained(config.urlbert_model_name)
         
+        # Auto-detect max length from model config
+        model_max_length = getattr(self.model.config, 'max_position_embeddings', 512)
+        self.actual_max_length = min(config.urlbert_max_length, model_max_length)
+        
+        if self.actual_max_length != config.urlbert_max_length and config.verbose > 0:
+            logger.info(f"Adjusted max_length from {config.urlbert_max_length} to {self.actual_max_length} (model limit)")
+        
         self.device = torch.device(
             config.urlbert_device if config.urlbert_device 
             else ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -242,444 +254,438 @@ class FeatureExtractor:
         """Extract 28 structural features from URL"""
         try:
             parsed = urlparse(url)
-            path, query = parsed.path, parsed.query
+            path = parsed.path
+            query = parsed.query
             
-            # Length features (3)
-            url_len, path_len, query_len = len(url), len(path), len(query)
+            # Basic counts
+            url_length = len(url)
+            path_length = len(path)
+            query_length = len(query)
             
-            # Path analysis (3)
-            segments = [s for s in path.split('/') if s]
-            num_segments = len(segments)
-            avg_seg_len = np.mean([len(s) for s in segments]) if segments else 0
-            max_seg_len = max([len(s) for s in segments]) if segments else 0
+            # Path analysis
+            path_segments = [s for s in path.split('/') if s]
+            n_path_segments = len(path_segments)
+            avg_segment_length = np.mean([len(s) for s in path_segments]) if path_segments else 0
+            max_segment_length = max([len(s) for s in path_segments]) if path_segments else 0
             
-            # Query parameters (1)
-            num_params = len(parse_qs(query))
+            # Character statistics
+            n_digits = sum(c.isdigit() for c in url)
+            n_letters = sum(c.isalpha() for c in url)
+            n_special = sum(not c.isalnum() for c in url)
+            digit_ratio = n_digits / len(url) if len(url) > 0 else 0
+            letter_ratio = n_letters / len(url) if len(url) > 0 else 0
             
-            # Character counts (9)
-            num_digits = sum(c.isdigit() for c in url)
-            num_letters = sum(c.isalpha() for c in url)
-            num_hyphens = url.count('-')
-            num_underscores = url.count('_')
-            num_dots = url.count('.')
-            num_slashes = url.count('/')
-            num_equals = url.count('=')
-            num_ampersands = url.count('&')
-            num_questions = url.count('?')
+            # Special characters
+            n_hyphens = url.count('-')
+            n_underscores = url.count('_')
+            n_dots = url.count('.')
+            n_slashes = url.count('/')
             
-            # Ratios (3)
-            digit_ratio = num_digits / max(url_len, 1)
-            letter_ratio = num_letters / max(url_len, 1)
-            special_ratio = (num_hyphens + num_underscores) / max(url_len, 1)
+            # Query parameters
+            n_query_params = len(parse_qs(query))
             
-            # Domain features (2)
-            domain_parts = parsed.netloc.split('.')
-            num_domain_parts = len(domain_parts)
-            has_www = 1 if 'www' in domain_parts else 0
+            # Entropy
+            char_counts = Counter(url)
+            char_probs = np.array([count / len(url) for count in char_counts.values()])
+            url_entropy = entropy(char_probs)
             
-            # Entropy (1)
-            url_entropy = entropy([url.count(c) for c in set(url)]) if len(set(url)) > 1 else 0
+            # Pattern matching (binary flags)
+            has_article_kw = int(any(kw in url.lower() for kw in ARTICLE_KEYWORDS))
+            has_product_kw = int(any(kw in url.lower() for kw in PRODUCT_KEYWORDS))
+            has_list_kw = int(any(kw in url.lower() for kw in LIST_KEYWORDS))
+            has_brand_kw = int(any(kw in url.lower() for kw in BRAND_KEYWORDS))
             
-            # Keyword matching (4)
-            url_lower = url.lower()
-            has_article_kw = any(kw in url_lower for kw in ARTICLE_KEYWORDS)
-            has_product_kw = any(kw in url_lower for kw in PRODUCT_KEYWORDS)
-            has_list_kw = any(kw in url_lower for kw in LIST_KEYWORDS)
-            has_brand_kw = any(kw in url_lower for kw in BRAND_KEYWORDS)
+            # Additional features
+            has_id = int(bool(re.search(r'\d{4,}', url)))
+            has_date = int(bool(re.search(r'\d{4}[-/]\d{2}[-/]\d{2}', url)))
+            ends_with_slash = int(url.endswith('/'))
+            is_homepage = int(path in ['', '/'])
             
-            # Extension features (2)
-            ext = self.normalizer.extract_extension(url)
-            has_content_ext = 1 if ext in ['html', 'htm', 'php', 'asp', 'jsp'] else 0
-            is_static = 1 if self.normalizer.is_static_resource(url) else 0
+            # Complexity measures
+            unique_char_ratio = len(set(url)) / len(url) if len(url) > 0 else 0
+            consonant_vowel_ratio = self._consonant_vowel_ratio(url)
             
-            # Total: 28 features
-            features = [
-                url_len, path_len, query_len,
-                num_segments, avg_seg_len, max_seg_len, num_params,
-                num_digits, num_letters, num_hyphens, num_underscores,
-                num_dots, num_slashes, num_equals, num_ampersands, num_questions,
-                digit_ratio, letter_ratio, special_ratio,
-                num_domain_parts, has_www, url_entropy,
-                has_article_kw, has_product_kw, has_list_kw, has_brand_kw,
-                has_content_ext, is_static
-            ]
-            
-            return np.array(features, dtype=np.float32)
-            
-        except Exception as e:
-            if self.config.verbose > 1:
-                logger.warning(f"Feature extraction failed: {e}")
+            return np.array([
+                url_length, path_length, query_length, n_path_segments,
+                avg_segment_length, max_segment_length, n_digits, n_letters,
+                n_special, digit_ratio, letter_ratio, n_hyphens, n_underscores,
+                n_dots, n_slashes, n_query_params, url_entropy, has_article_kw,
+                has_product_kw, has_list_kw, has_brand_kw, has_id, has_date,
+                ends_with_slash, is_homepage, unique_char_ratio, consonant_vowel_ratio,
+                len(parsed.netloc)
+            ], dtype=np.float32)
+        except:
             return np.zeros(28, dtype=np.float32)
     
-    def extract_interaction_features(self, urls: List[str], anchors: List[str]) -> np.ndarray:
-        """Extract URL-anchor interaction features"""
-        features = []
-        
-        for url, anchor in zip(urls, anchors):
-            if not anchor:
-                features.append([0, 0, 0, 0, 0, 0])
-                continue
-            
-            url_lower, anchor_lower = url.lower(), anchor.lower()
-            
-            # Word overlap
-            url_words = set(re.findall(r'\w+', url_lower))
-            anchor_words = set(re.findall(r'\w+', anchor_lower))
-            common = len(url_words & anchor_words)
-            jaccard = common / max(len(url_words | anchor_words), 1)
-            
-            # Length ratio
-            len_ratio = len(anchor) / max(len(url), 1)
-            
-            # Keyword flags
-            flags = [any(kw in anchor_lower for kw in kws)
-                    for kws in [ARTICLE_KEYWORDS, PRODUCT_KEYWORDS, LIST_KEYWORDS]]
-            
-            features.append([common, jaccard, len_ratio, *flags])
-        
-        return np.array(features, dtype=np.float32)
+    @staticmethod
+    def _consonant_vowel_ratio(text: str) -> float:
+        """Calculate consonant to vowel ratio"""
+        vowels = set('aeiouAEIOU')
+        text_letters = [c for c in text if c.isalpha()]
+        if not text_letters:
+            return 0.0
+        n_vowels = sum(1 for c in text_letters if c in vowels)
+        n_consonants = len(text_letters) - n_vowels
+        return n_consonants / n_vowels if n_vowels > 0 else float(n_consonants)
     
     def extract_tfidf_features(
-        self, 
-        urls: List[str], 
-        anchors: Optional[List[str]] = None,
-        is_training: bool = True
+        self,
+        urls: List[str],
+        anchors: Optional[List[str]],
+        is_training: bool
     ):
-        """Extract TF-IDF features (3 separate vectorizers for better accuracy)"""
-        if self.config.url_normalization:
-            urls = [self.normalizer.normalize(u) for u in urls]
-        
-        anchor_texts = [(a or '') for a in (anchors or [''] * len(urls))]
-        path_texts = [urlparse(u).path for u in urls]
-        
+        """Extract TF-IDF features"""
+        # URL TF-IDF
         if is_training:
-            # URL TF-IDF
             self.tfidf_url = TfidfVectorizer(
                 max_features=self.config.max_tfidf_features,
-                analyzer='char',
                 ngram_range=self.config.tfidf_ngram_range,
-                min_df=2,
-                max_df=0.9,
-                sublinear_tf=True
-            )
-            
-            # Path TF-IDF (separate for better accuracy)
-            self.tfidf_path = TfidfVectorizer(
-                max_features=min(6000, self.config.max_tfidf_features // 2),
                 analyzer='char',
-                ngram_range=(2, 4),
                 min_df=2,
-                max_df=0.9,
-                sublinear_tf=True
+                dtype=np.float32
             )
-            
-            # Anchor TF-IDF
-            self.tfidf_anchor = TfidfVectorizer(
-                max_features=min(3000, self.config.max_tfidf_features // 4),
-                analyzer='char',
-                ngram_range=(1, 3),
-                min_df=2,
-                max_df=0.9,
-                sublinear_tf=True
-            )
-            
-            X_url = self.tfidf_url.fit_transform(urls)
-            X_path = self.tfidf_path.fit_transform(path_texts)
-            X_anchor = self.tfidf_anchor.fit_transform(anchor_texts)
-            
-            if self.config.verbose > 1:
-                logger.info(f"TF-IDF - URL:{X_url.shape} Path:{X_path.shape} Anchor:{X_anchor.shape}")
+            url_tfidf = self.tfidf_url.fit_transform(urls)
         else:
-            X_url = self.tfidf_url.transform(urls)
-            X_path = self.tfidf_path.transform(path_texts)
-            X_anchor = self.tfidf_anchor.transform(anchor_texts)
+            url_tfidf = self.tfidf_url.transform(urls)
         
-        return hstack([X_url, X_path, X_anchor], format='csr')
+        # Anchor TF-IDF
+        if anchors and any(anchor.strip() for anchor in anchors):
+            # Only process if there are non-empty anchors
+            try:
+                if is_training:
+                    self.tfidf_anchor = TfidfVectorizer(
+                        max_features=self.config.max_tfidf_features // 2,
+                        ngram_range=(1, 3),
+                        min_df=2,
+                        dtype=np.float32
+                    )
+                    anchor_tfidf = self.tfidf_anchor.fit_transform(anchors)
+                else:
+                    if self.tfidf_anchor is not None:
+                        anchor_tfidf = self.tfidf_anchor.transform(anchors)
+                    else:
+                        anchor_tfidf = csr_matrix((len(urls), 0), dtype=np.float32)
+            except ValueError:
+                # Empty vocabulary - all anchors are empty or stopwords
+                if is_training:
+                    self.tfidf_anchor = None
+                anchor_tfidf = csr_matrix((len(urls), 0), dtype=np.float32)
+        else:
+            if is_training:
+                self.tfidf_anchor = None
+            anchor_tfidf = csr_matrix((len(urls), 0), dtype=np.float32)
+        
+        # Path TF-IDF
+        paths = [urlparse(u).path for u in urls]
+        if is_training:
+            self.tfidf_path = TfidfVectorizer(
+                max_features=self.config.max_tfidf_features // 3,
+                ngram_range=(1, 4),
+                analyzer='char',
+                min_df=2,
+                dtype=np.float32
+            )
+            path_tfidf = self.tfidf_path.fit_transform(paths)
+        else:
+            path_tfidf = self.tfidf_path.transform(paths)
+        
+        return hstack([url_tfidf, anchor_tfidf, path_tfidf], format='csr')
     
     def extract_categorical_features(
         self,
-        locations: List[str],
         urls: List[str],
-        is_training: bool = True
-    ) -> np.ndarray:
+        locations: Optional[List[str]],
+        is_training: bool
+    ) -> Tuple[np.ndarray, List[int]]:
         """
-        *** OPTIMIZATION: Extract categorical features as label-encoded integers ***
-        Uses a map for robust handling of unknown values during inference.
+        *** OPTIMIZATION: Use LabelEncoder instead of OneHotEncoder ***
+        Returns: (features_array, categorical_indices)
         """
-        locations_arr = np.array(locations)
+        # Extract extensions
         extensions = [self.normalizer.extract_extension(u) for u in urls]
-        extensions_arr = np.array(extensions)
+        
+        # Default locations
+        if locations is None:
+            locations = ['unknown'] * len(urls)
         
         if is_training:
             # Fit LabelEncoders
-            self.le_location.fit(locations_arr)
-            self.le_extension.fit(extensions_arr)
+            self.le_location.fit(locations)
+            self.le_extension.fit(extensions)
             
-            # Store maps for fast, safe transformation (handles unknowns)
-            # 0 is reserved for "unknown"
-            self.le_location_map_ = {cls: i+1 for i, cls in enumerate(self.le_location.classes_)}
-            self.le_extension_map_ = {cls: i+1 for i, cls in enumerate(self.le_extension.classes_)}
+            # Store mappings for reference
+            self.le_location_map_ = {label: idx for idx, label in enumerate(self.le_location.classes_)}
+            self.le_extension_map_ = {label: idx for idx, label in enumerate(self.le_extension.classes_)}
         
-        # Transform using maps, .get(key, 0) maps unknown keys to 0
-        loc_encoded = [self.le_location_map_.get(loc, 0) for loc in locations_arr]
-        ext_encoded = [self.le_extension_map_.get(ext, 0) for ext in extensions_arr]
-
-        return np.vstack([loc_encoded, ext_encoded]).T.astype(np.float32)
-
-    def extract_urlbert_features(self, texts: List[str]) -> np.ndarray:
-        """Extract URLBERT embeddings"""
-        max_len = min(self.config.urlbert_max_length, 
-                     getattr(self.model.config, "max_position_embeddings", 64))
+        # Transform
+        location_encoded = self.le_location.transform(locations).reshape(-1, 1)
+        extension_encoded = self.le_extension.transform(extensions).reshape(-1, 1)
         
-        class _Dataset(Dataset):
-            def __init__(self, data):
-                self.data = data
+        # Combine into dense array
+        categorical_features = np.hstack([location_encoded, extension_encoded]).astype(np.float32)
+        
+        # The indices of these categorical features (they will be at the end of the feature matrix)
+        # We'll set this after we know the full feature dimension
+        categorical_indices = [0, 1]  # Relative indices within categorical_features
+        
+        return categorical_features, categorical_indices
+    
+    def extract_urlbert_embeddings(self, urls: List[str]) -> np.ndarray:
+        """Extract URLBERT embeddings with optional layer extraction"""
+        class URLDataset(Dataset):
+            def __init__(self, urls, tokenizer, max_length):
+                self.urls = urls
+                self.tokenizer = tokenizer
+                self.max_length = max_length
+            
             def __len__(self):
-                return len(self.data)
-            def __getitem__(self, i):
-                return self.data[i]
+                return len(self.urls)
+            
+            def __getitem__(self, idx):
+                encoding = self.tokenizer(
+                    self.urls[idx],
+                    max_length=self.max_length,
+                    padding='max_length',
+                    truncation=True,
+                    return_tensors='pt'
+                )
+                return {k: v.squeeze(0) for k, v in encoding.items()}
         
-        loader = DataLoader(
-            _Dataset(texts),
+        dataset = URLDataset(urls, self.tokenizer, self.actual_max_length)
+        dataloader = DataLoader(
+            dataset,
             batch_size=self.config.urlbert_batch_size,
             shuffle=False,
             num_workers=0
         )
         
-        features = []
-        self.model.eval()
+        embeddings = []
         
         with torch.inference_mode():
-            for batch in loader:
-                encoded = self.tokenizer(
-                    list(batch),
-                    padding=True,
-                    truncation=True,
-                    max_length=max_len,
-                    return_tensors='pt'
-                )
+            for batch in dataloader:
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
                 
-                input_ids = encoded['input_ids'].to(self.device)
-                attention_mask = encoded['attention_mask'].to(self.device)
+                # Prepare inputs, explicitly handle token_type_ids
+                model_inputs = {
+                    'input_ids': input_ids,
+                    'attention_mask': attention_mask,
+                    'output_hidden_states': True
+                }
                 
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=bool(self.config.urlbert_extract_layers)
-                )
+                # Add token_type_ids if present in batch
+                if 'token_type_ids' in batch:
+                    model_inputs['token_type_ids'] = batch['token_type_ids'].to(self.device)
                 
-                # Mean pooling or CLS
-                if self.config.urlbert_use_mean_pooling:
-                    hidden = outputs.last_hidden_state
-                    mask_exp = attention_mask.unsqueeze(-1).expand(hidden.size()).float()
-                    sum_emb = torch.sum(hidden * mask_exp, dim=1)
-                    sum_mask = torch.clamp(mask_exp.sum(dim=1), min=1e-9)
-                    batch_feat = (sum_emb / sum_mask).cpu().numpy()
-                else:
-                    batch_feat = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+                outputs = self.model(**model_inputs)
                 
-                # Multi-layer fusion
+                # Extract embeddings based on config
                 if self.config.urlbert_extract_layers:
-                    layer_feats = []
-                    for idx in self.config.urlbert_extract_layers:
-                        layer_out = outputs.hidden_states[idx]
-                        if self.config.urlbert_use_mean_pooling:
-                            mask_exp = attention_mask.unsqueeze(-1).expand(layer_out.size()).float()
-                            layer_feat = torch.sum(layer_out * mask_exp, dim=1)
-                            layer_feat = layer_feat / torch.clamp(mask_exp.sum(dim=1), min=1e-9)
-                        else:
-                            layer_feat = layer_out[:, 0, :]
-                        layer_feats.append(layer_feat.cpu().numpy())
+                    # Extract specific layers
+                    hidden_states = outputs.hidden_states
+                    layer_embeddings = [hidden_states[i][:, 0, :] for i in self.config.urlbert_extract_layers]
                     
-                    batch_feat = np.concatenate([batch_feat] + layer_feats, axis=1)
+                    if self.config.urlbert_use_mean_pooling:
+                        # Add mean pooling
+                        last_hidden = outputs.last_hidden_state
+                        # Fix: use proper broadcasting for mask
+                        mask = attention_mask.unsqueeze(-1)  # [batch, seq_len, 1]
+                        masked_hidden = last_hidden * mask  # [batch, seq_len, hidden_dim]
+                        sum_embeddings = torch.sum(masked_hidden, dim=1)  # [batch, hidden_dim]
+                        sum_mask = torch.clamp(mask.sum(dim=1), min=1e-9)  # [batch, 1]
+                        mean_pooled = sum_embeddings / sum_mask
+                        layer_embeddings.append(mean_pooled)
+                    
+                    batch_embedding = torch.cat(layer_embeddings, dim=1)
+                else:
+                    # Use [CLS] token or mean pooling
+                    if self.config.urlbert_use_mean_pooling:
+                        last_hidden = outputs.last_hidden_state
+                        # Fix: use proper broadcasting for mask
+                        mask = attention_mask.unsqueeze(-1)  # [batch, seq_len, 1]
+                        masked_hidden = last_hidden * mask  # [batch, seq_len, hidden_dim]
+                        sum_embeddings = torch.sum(masked_hidden, dim=1)  # [batch, hidden_dim]
+                        sum_mask = torch.clamp(mask.sum(dim=1), min=1e-9)  # [batch, 1]
+                        batch_embedding = sum_embeddings / sum_mask
+                    else:
+                        batch_embedding = outputs.last_hidden_state[:, 0, :]
                 
-                features.append(batch_feat)
+                embeddings.append(batch_embedding.cpu().numpy())
         
-        return np.vstack(features).astype(np.float32)
+        embeddings = np.vstack(embeddings)
+        
+        # *** OPTIMIZATION: Apply SVD dimensionality reduction ***
+        if self.svd_bert is not None:
+            if not hasattr(self.svd_bert, 'components_'):
+                embeddings = self.svd_bert.fit_transform(embeddings)
+            else:
+                embeddings = self.svd_bert.transform(embeddings)
+        
+        return embeddings.astype(np.float32)
     
     def extract_all_features(
         self,
         urls: List[str],
         anchors: Optional[List[str]] = None,
         locations: Optional[List[str]] = None,
-        is_training: bool = True
-    ):
+        is_training: bool = False
+    ) -> np.ndarray:
         """Extract and combine all features"""
-        if self.config.verbose > 0:
-            logger.info(f"Extracting features...")
-        
-        if anchors is None:
-            anchors = [''] * len(urls)
-        if locations is None:
-            locations = ['body'] * len(urls)
-        
-        # 1. Structural features (DENSE)
+        # 1. Structural features (28 dimensions)
         structural = np.vstack([self.extract_structural_features(u) for u in urls])
         
-        # 2. Interaction features (DENSE)
-        interaction = self.extract_interaction_features(urls, anchors)
+        # 2. TF-IDF features (sparse)
+        tfidf = self.extract_tfidf_features(urls, anchors, is_training)
         
-        # 3. TF-IDF features (SPARSE)
-        X_text = self.extract_tfidf_features(urls, anchors, is_training)
+        # 3. Categorical features (2 dimensions: location, extension)
+        categorical, cat_relative_indices = self.extract_categorical_features(urls, locations, is_training)
         
-        # 4. URLBERT features (DENSE)
-        X_bert_raw = self.extract_urlbert_features(urls)
+        # 4. URLBERT embeddings (dense, possibly reduced via SVD)
+        if self.config.verbose > 1 and is_training:
+            logger.info("  Extracting URLBERT embeddings...")
+        bert = self.extract_urlbert_embeddings(urls)
         
-        # 5. *** OPTIMIZATION: Reduce BERT embedding dimensions *** (DENSE)
-        X_bert = X_bert_raw
-        if self.svd_bert:
-            if is_training:
-                if self.config.verbose > 1:
-                    logger.info(f"Fitting SVD to BERT embeddings ({X_bert_raw.shape[1]} -> {self.config.bert_embedding_dim})")
-                self.svd_bert.fit(X_bert_raw)
-            X_bert = self.svd_bert.transform(X_bert_raw)
-        
-        # 6. Combine DENSE numerical features
-        dense_numerical = np.hstack([structural, interaction, X_bert]).astype(np.float32)
+        # Combine all features
+        # Order: [structural (28) | categorical (2) | tfidf (sparse) | bert (dense)]
+        dense_features = np.hstack([structural, categorical, bert])
         
         if is_training:
-            self.scaler.fit(dense_numerical)
-        dense_numerical = self.scaler.transform(dense_numerical)
+            dense_features = self.scaler.fit_transform(dense_features)
+        else:
+            dense_features = self.scaler.transform(dense_features)
         
-        X_dense_numerical_sparse = csr_matrix(dense_numerical)
+        # Convert to sparse for efficient hstack
+        dense_sparse = csr_matrix(dense_features)
+        X = hstack([dense_sparse, tfidf], format='csr')
         
-        # 7. *** OPTIMIZATION: Get LabelEncoded categorical features *** (DENSE)
-        X_cat_dense = self.extract_categorical_features(locations, urls, is_training)
-        X_cat_sparse = csr_matrix(X_cat_dense)
+        # *** OPTIMIZATION: Store categorical feature indices ***
+        # Categorical features are at positions [28, 29] in the dense array
+        # which translates to [28, 29] in the final hstack matrix
+        if is_training:
+            self.categorical_feature_indices_ = [28, 29]
         
-        # 8. *** OPTIMIZATION: Store categorical feature indices for LGBM ***
-        n_tfidf = X_text.shape[1]
-        n_dense_num = X_dense_numerical_sparse.shape[1]
-        
-        # Indices are relative to the *final* hstacked matrix
-        self.categorical_feature_indices_ = [
-            n_tfidf + n_dense_num,     # First categorical feature (location)
-            n_tfidf + n_dense_num + 1  # Second categorical feature (extension)
-        ]
-        
-        # 9. Combine all
-        X = hstack([X_text, X_dense_numerical_sparse, X_cat_sparse], format='csr')
-        
-        if self.config.verbose > 0:
-            logger.info(f"Feature shape: {X.shape}")
-            if self.config.verbose > 1:
-                logger.info(f"  TF-IDF feats: {n_tfidf}")
-                logger.info(f"  Dense/Scaled feats: {n_dense_num} (BERT reduced to {X_bert.shape[1]})")
-                logger.info(f"  Categorical feats: {X_cat_sparse.shape[1]} at indices {self.categorical_feature_indices_}")
-
         return X
 
 
 # ==================== Data Processing ====================
 
 class DataProcessor:
-    """Fast data processing"""
+    """Data loading and cleaning"""
     
     @staticmethod
     def load_and_clean(
         json_file: str,
         normalizer: URLNormalizer,
-        remove_duplicates: bool = True,
-        min_samples: int = 5,
-        verbose: int = 0
+        remove_duplicates: bool,
+        min_samples_per_class: int,
+        verbose: int
     ) -> Tuple[List[str], List[str], List[str], List[str]]:
         """Load and clean data"""
-        filepath = Path(json_file)
-        if not filepath.exists():
-            raise FileNotFoundError(f"Data file not found: {filepath}")
-        
         if verbose > 0:
-            logger.info(f"Loading data from: {filepath.name}")
+            logger.info(f"\nLoading data from: {json_file}")
         
-        with open(filepath, "r", encoding="utf-8") as f:
+        # Load JSON
+        with open(json_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
-        # Filter and process
-        rows = []
+        if verbose > 0:
+            logger.info(f"Raw samples: {len(data)}")
+        
+        # Parse and filter
+        urls, labels, anchors, locations = [], [], [], []
+        
         for item in data:
-            if "url" not in item:
+            url = item.get('url', '').strip()
+            label = item.get('label', '').strip().lower()
+            anchor = item.get('anchor_text', '').strip()
+            location = item.get('location', 'unknown').strip().lower()
+            
+            if not url or not label:
                 continue
             
-            url = item["url"]
+            # Normalize URL
+            url = normalizer.normalize(url)
             
+            # Skip static resources
             if normalizer.is_static_resource(url):
                 continue
             
-            label_raw = item.get("label") or item.get("weak_label")
-            if not label_raw or label_raw == "skip":
-                continue
+            # Map label
+            label = map_label(label, url)
             
-            label = map_label(label_raw, url)
             if label not in ALLOWED_LABELS:
                 continue
             
-            rows.append({
-                "url": url,
-                "label": label,
-                "anchor": item.get("anchor") or "",
-                "location": item.get("location") or "body"
-            })
+            urls.append(url)
+            labels.append(label)
+            anchors.append(anchor if anchor else '')
+            locations.append(location)
         
-        if len(rows) == 0:
-            raise ValueError("No valid data found!")
-        
-        # Extract fields
-        urls = [r["url"] for r in rows]
-        labels = [r["label"] for r in rows]
-        anchors = [r["anchor"] for r in rows]
-        locations = [r["location"] for r in rows]
+        if verbose > 0:
+            logger.info(f"After filtering: {len(urls)}")
         
         # Remove duplicates
         if remove_duplicates:
-            seen = set()
-            result = [[], [], [], []]
-            for u, l, a, loc in zip(urls, labels, anchors, locations):
-                if u not in seen:
-                    seen.add(u)
-                    result[0].append(u)
-                    result[1].append(l)
-                    result[2].append(a)
-                    result[3].append(loc)
-            urls, labels, anchors, locations = result
+            seen = {}
+            unique_indices = []
+            for i, url in enumerate(urls):
+                if url not in seen:
+                    seen[url] = i
+                    unique_indices.append(i)
+            
+            urls = [urls[i] for i in unique_indices]
+            labels = [labels[i] for i in unique_indices]
+            anchors = [anchors[i] for i in unique_indices]
+            locations = [locations[i] for i in unique_indices]
+            
+            if verbose > 0:
+                logger.info(f"After deduplication: {len(urls)}")
         
-        # Filter low-frequency classes
+        # Filter by class frequency
         label_counts = Counter(labels)
-        valid_labels = {l for l, c in label_counts.items() if c >= min_samples}
-        result = [[], [], [], []]
-        for u, l, a, loc in zip(urls, labels, anchors, locations):
-            if l in valid_labels:
-                result[0].append(u)
-                result[1].append(l)
-                result[2].append(a)
-                result[3].append(loc)
-        urls, labels, anchors, locations = result
+        valid_labels = {label for label, count in label_counts.items() if count >= min_samples_per_class}
         
-        # Show distribution
+        indices = [i for i, label in enumerate(labels) if label in valid_labels]
+        urls = [urls[i] for i in indices]
+        labels = [labels[i] for i in indices]
+        anchors = [anchors[i] for i in indices]
+        locations = [locations[i] for i in indices]
+        
         if verbose > 0:
-            label_counts = Counter(labels)
-            logger.info(f"Loaded {len(urls)} samples with {len(label_counts)} classes")
-            if verbose > 1:
-                for label, count in sorted(label_counts.items(), key=lambda x: -x[1]):
-                    logger.info(f"  {label}: {count} ({count/len(labels)*100:.1f}%)")
+            logger.info(f"Final samples: {len(urls)}")
+            logger.info("Class distribution:")
+            for label, count in sorted(Counter(labels).items()):
+                logger.info(f"  {label}: {count}")
         
         return urls, labels, anchors, locations
 
 
-# ==================== Ensemble Model ====================
+# ==================== Stacking Ensemble ====================
 
-class EnsembleClassifier:
-    """Weighted ensemble classifier"""
+class StackingEnsembleClassifier:
+    """Stacking ensemble with out-of-fold predictions and meta-model"""
     
     def __init__(self, config: ModelConfig, n_classes: int):
         self.config = config
         self.n_classes = n_classes
-        self.models = []
-        self.weights = []
+        self.base_models = []
+        self.meta_model = None
         
+        # Initialize base models
         if HAS_LGB:
-            self.models.append(('lgb', self._create_lgb()))
+            self.base_models.append(('lgb', self._create_lgb()))
         if HAS_XGB and config.use_ensemble:
-            self.models.append(('xgb', self._create_xgb()))
+            self.base_models.append(('xgb', self._create_xgb()))
+        
+        # Initialize meta model (Logistic Regression)
+        self.meta_model = LogisticRegression(
+            C=config.meta_C,
+            max_iter=config.meta_max_iter,
+            multi_class='multinomial',
+            solver='lbfgs',
+            random_state=config.random_state,
+            n_jobs=config.n_jobs
+        )
     
     def _create_lgb(self):
         """Create LightGBM"""
@@ -715,16 +721,23 @@ class EnsembleClassifier:
             verbosity=0
         )
     
-    def fit(self, X_train, y_train, X_val=None, y_val=None, categorical_feature: List[int] = None):
+    def fit_base_models(self, X_train, y_train, X_val=None, y_val=None, categorical_feature: List[int] = None):
         """
-        Train all models
-        *** OPTIMIZATION: Pass 'categorical_feature' list to LGBM ***
+        Train base models (called during K-fold to generate OOF predictions)
         """
-        self.weights = []
+        trained_models = []
         
-        for name, model in self.models:
+        for name, model_template in self.base_models:
+            # Create a fresh instance
+            if name == 'lgb':
+                model = self._create_lgb()
+            elif name == 'xgb':
+                model = self._create_xgb()
+            else:
+                continue
+            
             if self.config.verbose > 1:
-                logger.info(f"  Training {name}...")
+                logger.info(f"    Training {name}...")
             
             # Prepare fit parameters
             fit_params = {}
@@ -735,44 +748,87 @@ class EnsembleClassifier:
                 if name == 'lgb':
                     if X_val is not None:
                         fit_params['callbacks'] = [lgb.early_stopping(self.config.early_stopping_rounds, verbose=False)]
-                    # Pass categorical feature indices *only* to LGBM
                     fit_params['categorical_feature'] = categorical_feature
                     model.fit(X_train, y_train, **fit_params)
                 
                 elif name == 'xgb':
                     if X_val is not None:
-                        fit_params['verbose'] = False # XGB specific
+                        fit_params['verbose'] = False
                     model.fit(X_train, y_train, **fit_params)
                 
+            except Exception as e:
+                if self.config.verbose > 1:
+                    logger.warning(f"    {name} error: {e}")
+                model.fit(X_train, y_train)
+            
+            trained_models.append((name, model))
+        
+        return trained_models
+    
+    def fit(self, X, y, oof_predictions: np.ndarray):
+        """
+        Fit the stacking ensemble using out-of-fold predictions
+        
+        Args:
+            X: Full training data (used to retrain base models)
+            y: Full training labels
+            oof_predictions: Out-of-fold predictions from K-fold CV [n_samples, n_base_models * n_classes]
+        """
+        # Step 1: Retrain base models on full training data
+        if self.config.verbose > 0:
+            logger.info("\nRetraining base models on full dataset...")
+        
+        trained_models = []
+        for name, model_template in self.base_models:
+            if name == 'lgb':
+                model = self._create_lgb()
+            elif name == 'xgb':
+                model = self._create_xgb()
+            else:
+                continue
+            
+            if self.config.verbose > 1:
+                logger.info(f"  Training {name}...")
+            
+            try:
+                if name == 'lgb':
+                    model.fit(X, y, categorical_feature=getattr(self, 'categorical_feature_', None))
                 else:
-                    # For any other model
-                    model.fit(X_train, y_train)
-
+                    model.fit(X, y)
             except Exception as e:
                 if self.config.verbose > 1:
                     logger.warning(f"  {name} error: {e}")
-                # Fallback to simple fit
-                model.fit(X_train, y_train)
+                model.fit(X, y)
             
-            # Calculate weights
-            if X_val is not None:
-                val_pred = model.predict(X_val)
-                val_acc = accuracy_score(y_val, val_pred)
-                self.weights.append(val_acc)
-                if self.config.verbose > 1:
-                    logger.info(f"  {name} acc: {val_acc:.4f}")
-            else:
-                self.weights.append(1.0)
+            trained_models.append((name, model))
         
-        # Normalize weights
-        total = sum(self.weights)
-        self.weights = [w / total for w in self.weights]
+        self.base_models = trained_models
+        
+        # Step 2: Train meta-model on OOF predictions
+        if self.config.verbose > 0:
+            logger.info("Training meta-model on OOF predictions...")
+        
+        self.meta_model.fit(oof_predictions, y)
+        
+        if self.config.verbose > 1:
+            # Evaluate meta-model on training data
+            train_pred = self.meta_model.predict(oof_predictions)
+            train_acc = accuracy_score(y, train_pred)
+            logger.info(f"  Meta-model training accuracy: {train_acc:.4f}")
     
     def predict_proba(self, X):
-        """Weighted prediction"""
-        probas = [model.predict_proba(X) * weight 
-                  for (_, model), weight in zip(self.models, self.weights)]
-        return np.sum(probas, axis=0)
+        """Predict probabilities using stacking"""
+        # Get predictions from base models
+        base_predictions = []
+        for name, model in self.base_models:
+            pred_proba = model.predict_proba(X)
+            base_predictions.append(pred_proba)
+        
+        # Stack predictions: [n_samples, n_base_models * n_classes]
+        stacked_predictions = np.hstack(base_predictions)
+        
+        # Use meta-model to make final prediction
+        return self.meta_model.predict_proba(stacked_predictions)
     
     def predict(self, X):
         """Predict classes"""
@@ -782,7 +838,7 @@ class EnsembleClassifier:
 # ==================== Trainer ====================
 
 class URLBERTTrainer:
-    """Main trainer with clean logging"""
+    """Main trainer with Stacking ensemble"""
     
     def __init__(self, config: Optional[ModelConfig] = None):
         self.config = config or ModelConfig()
@@ -795,10 +851,10 @@ class URLBERTTrainer:
         json_file: str,
         save_path: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Train with K-fold CV"""
+        """Train with K-fold CV and Stacking"""
         if self.config.verbose > 0:
             logger.info("="*60)
-            logger.info("Training URLBERT Classifier")
+            logger.info("Training URLBERT Stacking Classifier")
             logger.info("="*60)
         
         # Load data
@@ -819,38 +875,71 @@ class URLBERTTrainer:
         
         # Extract features
         X = self.fe.extract_all_features(urls, anchors, locations, is_training=True)
-        # *** OPTIMIZATION: Get fitted categorical indices from the feature extractor ***
         cat_indices = self.fe.categorical_feature_indices_
         
-        # K-fold CV
+        # K-fold CV for Out-of-Fold predictions
         domains = [urlparse(u).netloc for u in urls]
         gkf = GroupKFold(n_splits=self.config.n_folds)
         
+        # Initialize OOF predictions array
+        n_base_models = 2 if (HAS_LGB and HAS_XGB and self.config.use_ensemble) else 1
+        oof_predictions = np.zeros((len(y), n_base_models * n_classes), dtype=np.float32)
+        
         fold_results = []
-        fold_models = []
         
         for fold, (idx_tr, idx_val) in enumerate(gkf.split(X, y, groups=domains), 1):
             if self.config.verbose > 0:
-                logger.info(f"\nFold {fold}/{self.config.n_folds}")
+                logger.info(f"\n{'='*60}")
+                logger.info(f"Fold {fold}/{self.config.n_folds}")
+                logger.info(f"{'='*60}")
             
             X_train, X_val = X[idx_tr], X[idx_val]
             y_train, y_val = y[idx_tr], y[idx_val]
             
-            # Train
-            model = EnsembleClassifier(self.config, n_classes)
-            # *** OPTIMIZATION: Pass indices to the fit method ***
-            model.fit(X_train, y_train, X_val, y_val, categorical_feature=cat_indices)
+            # Create a temporary ensemble for this fold
+            temp_ensemble = StackingEnsembleClassifier(self.config, n_classes)
             
-            # Evaluate
-            y_val_pred = model.predict(X_val)
+            # Train base models
+            trained_models = temp_ensemble.fit_base_models(
+                X_train, y_train, X_val, y_val, categorical_feature=cat_indices
+            )
+            
+            # Generate OOF predictions for this fold
+            fold_oof_preds = []
+            for name, model in trained_models:
+                pred_proba = model.predict_proba(X_val)
+                fold_oof_preds.append(pred_proba)
+                
+                # Evaluate individual model
+                val_pred = model.predict(X_val)
+                val_acc = accuracy_score(y_val, val_pred)
+                if self.config.verbose > 1:
+                    logger.info(f"    {name} val accuracy: {val_acc:.4f}")
+            
+            # Stack predictions for this fold
+            fold_oof_stacked = np.hstack(fold_oof_preds)
+            oof_predictions[idx_val] = fold_oof_stacked
+            
+            # Train a temporary meta-model for validation
+            temp_meta = LogisticRegression(
+                C=self.config.meta_C,
+                max_iter=self.config.meta_max_iter,
+                multi_class='multinomial',
+                solver='lbfgs',
+                random_state=self.config.random_state,
+                n_jobs=self.config.n_jobs
+            )
+            temp_meta.fit(fold_oof_stacked, y_val)
+            
+            # Evaluate stacking on validation set
+            y_val_pred = temp_meta.predict(fold_oof_stacked)
             val_acc = accuracy_score(y_val, y_val_pred)
             val_f1 = f1_score(y_val, y_val_pred, average='macro', zero_division=0)
             
             if self.config.verbose > 0:
-                logger.info(f"  Acc: {val_acc:.4f}, F1: {val_f1:.4f}")
+                logger.info(f"  Stacking Acc: {val_acc:.4f}, F1: {val_f1:.4f}")
             
             fold_results.append({'fold': fold, 'accuracy': val_acc, 'f1': val_f1})
-            fold_models.append(model)
         
         # Summary
         avg_acc = np.mean([r['accuracy'] for r in fold_results])
@@ -864,23 +953,20 @@ class URLBERTTrainer:
             logger.info(f"Avg F1 Score: {avg_f1:.4f} ± {std_f1:.4f}")
             logger.info(f"{'='*60}")
         
-        # Select best model
-        best_idx = np.argmax([r['accuracy'] for r in fold_results])
-        self.model = fold_models[best_idx]
-        
-        # Retrain on full data
+        # Train final stacking model on full data with OOF predictions
         if self.config.verbose > 0:
-            logger.info("\nRetraining on full dataset...")
-        self.model = EnsembleClassifier(self.config, n_classes)
-        # *** OPTIMIZATION: Pass indices to the final fit method ***
-        self.model.fit(X, y, categorical_feature=cat_indices)
+            logger.info("\nTraining final stacking ensemble...")
+        
+        self.model = StackingEnsembleClassifier(self.config, n_classes)
+        self.model.categorical_feature_ = cat_indices
+        self.model.fit(X, y, oof_predictions)
         
         # Save
         if save_path:
             self.save_model(save_path)
         
         if self.config.verbose > 0:
-            logger.info("Training completed!")
+            logger.info("\nTraining completed!")
         
         return {
             'avg_accuracy': avg_acc,
@@ -935,34 +1021,6 @@ class URLBERTTrainer:
         trainer.le = pkg['label_encoder']
         
         return trainer
-    
-    def predict(
-        self,
-        urls: List[str],
-        anchors: Optional[List[str]] = None,
-        locations: Optional[List[str]] = None
-    ) -> List[str]:
-        """Predict categories"""
-        if self.model is None:
-            raise ValueError("Model not trained")
-        
-        X = self.fe.extract_all_features(urls, anchors, locations, is_training=False)
-        y_pred = self.model.predict(X)
-        return list(self.le.inverse_transform(y_pred))
-    
-    def predict_proba(
-        self,
-        urls: List[str],
-        anchors: Optional[List[str]] = None,
-        locations: Optional[List[str]] = None
-    ) -> np.ndarray:
-        """Predict probabilities"""
-        if self.model is None:
-            raise ValueError("Model not trained")
-        
-        X = self.fe.extract_all_features(urls, anchors, locations, is_training=False)
-        return self.model.predict_proba(X)
-
 
 # ==================== Main ====================
 
@@ -974,9 +1032,11 @@ def main():
         max_tfidf_features=12000,
         urlbert_use_mean_pooling=True,
         urlbert_extract_layers=[-4, -3, -2, -1],
-        bert_embedding_dim=128,  # <-- New optimization parameter
+        bert_embedding_dim=128,
         use_ensemble=True,
         n_folds=5,
+        meta_C=1.0,  # Meta-model regularization
+        meta_max_iter=1000,
         verbose=1  # 0=minimal, 1=normal, 2=detailed
     )
     
@@ -984,26 +1044,11 @@ def main():
     trainer = URLBERTTrainer(config)
     results = trainer.train(
         json_file="training_data/labeled_urls.json",
-        save_path="urlbert_model.pkl"
+        save_path="urlbert_stacking_model.pkl"
     )
     
     print(f"\n✓ Accuracy: {results['avg_accuracy']:.4f} ± {results['std_accuracy']:.4f}")
     print(f"✓ F1 Score: {results['avg_f1']:.4f} ± {results['std_f1']:.4f}")
-    
-    # Predict
-    test_urls = [
-        "https://example.com/blog/article-title",
-        "https://example.com/products/item-123"
-    ]
-    
-    predictions = trainer.predict(test_urls)
-    probas = trainer.predict_proba(test_urls)
-    
-    print("\nPredictions:")
-    for url, pred, proba in zip(test_urls, predictions, probas):
-        print(f"\n{url}")
-        print(f"  → {pred} ({max(proba):.2%})")
-
 
 if __name__ == "__main__":
     main()
