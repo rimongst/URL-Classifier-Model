@@ -1,4 +1,5 @@
 training_data/
+sites.txt
 NLP/
 urlbert_classifier/
 .venv/
