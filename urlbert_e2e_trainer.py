@@ -62,6 +62,9 @@ class E2EConfig:
     max_tfidf_features: int = 8000
     tfidf_ngram_range: Tuple[int, int] = (1, 4)
     
+    # Location Embedding Dim
+    location_embed_dim: int = 16 # Dimension for the location embedding
+    
     tabular_hidden_dim: int = 128  # MLP hidden dimension for tabular features
     tabular_output_dim: int = 64   # Final tabular embedding dimension
     tabular_dropout: float = 0.3
@@ -77,6 +80,9 @@ class E2EConfig:
     warmup_epochs: int = 1
     weight_decay: float = 0.01
     gradient_clip: float = 1.0
+    
+    use_focal_loss: bool = True
+    focal_loss_gamma: float = 2.0
     
     # Cross-validation
     n_folds: int = 5
@@ -170,7 +176,7 @@ class URLNormalizer:
 # ==================== Feature Extraction ====================
 
 class FeatureExtractor:
-    """Extract structural and TF-IDF features"""
+    """Extract structural, interaction, and TF-IDF features"""
     
     def __init__(self, config: E2EConfig):
         self.config = config
@@ -180,6 +186,9 @@ class FeatureExtractor:
         self.tfidf_url = None
         self.tfidf_pca = None
         self.scaler = StandardScaler()
+        
+        # LabelEncoder for location
+        self.le_location = LabelEncoder()
     
     def extract_structural_features(self, url: str) -> np.ndarray:
         """Extract 28 structural features from URL"""
@@ -259,6 +268,35 @@ class FeatureExtractor:
         n_consonants = len(text_letters) - n_vowels
         return n_consonants / n_vowels if n_vowels > 0 else float(n_consonants)
     
+    # *** NEW: Added interaction features from GBDT script ***
+    def extract_interaction_features(self, urls: List[str], anchors: List[str]) -> np.ndarray:
+        """Extract URL-anchor interaction features (6 features)"""
+        features = []
+        
+        for url, anchor in zip(urls, anchors):
+            if not anchor:
+                features.append([0, 0, 0, 0, 0, 0])
+                continue
+            
+            url_lower, anchor_lower = url.lower(), anchor.lower()
+            
+            # Word overlap
+            url_words = set(re.findall(r'\w+', url_lower))
+            anchor_words = set(re.findall(r'\w+', anchor_lower))
+            common = len(url_words & anchor_words)
+            jaccard = common / max(len(url_words | anchor_words), 1)
+            
+            # Length ratio
+            len_ratio = len(anchor) / max(len(url), 1)
+            
+            # Keyword flags (3 features)
+            flags = [any(kw in anchor_lower for kw in kws)
+                    for kws in [ARTICLE_KEYWORDS, PRODUCT_KEYWORDS, LIST_KEYWORDS]]
+            
+            features.append([common, jaccard, len_ratio, *flags])
+        
+        return np.array(features, dtype=np.float32)
+
     def fit_tfidf(self, urls: List[str]):
         """Fit TF-IDF and PCA"""
         if not self.config.use_tfidf:
@@ -293,28 +331,50 @@ class FeatureExtractor:
     def extract_all_tabular_features(
         self,
         urls: List[str],
+        anchors: List[str],
+        locations: List[str],
         fit: bool = False
-    ) -> np.ndarray:
-        """Extract and combine all tabular features"""
-        # Structural features
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Extract and combine all tabular features for the MLP.
+        Returns:
+            - X_tabular (for MLP): Scaled [structural, interaction, tfidf] features
+            - location_ids (for Embedding): LabelEncoded location IDs
+        """
+        # 1. Structural features
         structural = np.vstack([self.extract_structural_features(u) for u in urls])
         
-        # TF-IDF features
+        # 2. *** NEW: Interaction features ***
+        interaction = self.extract_interaction_features(urls, anchors)
+        
+        # 3. TF-IDF features
         if self.config.use_tfidf:
             if fit:
                 self.fit_tfidf(urls)
             tfidf = self.extract_tfidf_features(urls)
-            features = np.hstack([structural, tfidf])
+            # Combine all features for the MLP
+            features_for_mlp = np.hstack([structural, interaction, tfidf])
         else:
-            features = structural
+            features_for_mlp = np.hstack([structural, interaction])
         
-        # Scale
+        # 4. Scale MLP features
         if fit:
-            features = self.scaler.fit_transform(features)
+            features_for_mlp = self.scaler.fit_transform(features_for_mlp)
         else:
-            features = self.scaler.transform(features)
+            features_for_mlp = self.scaler.transform(features_for_mlp)
         
-        return features.astype(np.float32)
+        # 5. *** NEW: Handle Location features (for Embedding layer) ***
+        locations_arr = np.array(locations)
+        if fit:
+            location_ids = self.le_location.fit_transform(locations_arr)
+        else:
+            # Handle unseen locations during inference
+            location_ids = np.array([
+                self.le_location.transform([loc])[0] if loc in self.le_location.classes_ else 0
+                for loc in locations_arr
+            ])
+            
+        return features_for_mlp.astype(np.float32), location_ids.astype(np.int64)
 
 
 # ==================== Data Processing ====================
@@ -329,8 +389,10 @@ class DataProcessor:
         remove_duplicates: bool,
         min_samples_per_class: int,
         verbose: int
-    ) -> Tuple[List[str], List[str]]:
-        """Load and clean data"""
+    ) -> Tuple[List[str], List[str], List[str], List[str]]:
+        """
+        *** UPDATED: Load and clean data, returning anchors and locations ***
+        """
         if verbose > 0:
             logger.info(f"\nLoading data from: {json_file}")
         
@@ -342,15 +404,17 @@ class DataProcessor:
             logger.info(f"Raw samples: {len(data)}")
         
         # Parse and filter
-        urls, labels = [], []
+        urls, labels, anchors, locations = [], [], [], []
         
         for item in data:
             url = item.get('url', '').strip()
-            label = item.get('label', '').strip().lower()
+            label = item.get('label') or item.get('weak_label')
             
             if not url or not label:
                 continue
             
+            label = label.strip().lower()
+
             # Normalize URL
             url = normalizer.normalize(url)
             
@@ -366,6 +430,9 @@ class DataProcessor:
             
             urls.append(url)
             labels.append(label)
+            # Add anchor and location
+            anchors.append(item.get('anchor', ''))
+            locations.append(item.get('location', 'body'))
         
         if verbose > 0:
             logger.info(f"After filtering: {len(urls)}")
@@ -381,6 +448,8 @@ class DataProcessor:
             
             urls = [urls[i] for i in unique_indices]
             labels = [labels[i] for i in unique_indices]
+            anchors = [anchors[i] for i in unique_indices]
+            locations = [locations[i] for i in unique_indices]
             
             if verbose > 0:
                 logger.info(f"After deduplication: {len(urls)}")
@@ -392,6 +461,8 @@ class DataProcessor:
         indices = [i for i, label in enumerate(labels) if label in valid_labels]
         urls = [urls[i] for i in indices]
         labels = [labels[i] for i in indices]
+        anchors = [anchors[i] for i in indices]
+        locations = [locations[i] for i in indices]
         
         if verbose > 0:
             logger.info(f"Final samples: {len(urls)}")
@@ -399,25 +470,29 @@ class DataProcessor:
             for label, count in sorted(Counter(labels).items()):
                 logger.info(f"  {label}: {count}")
         
-        return urls, labels
+        return urls, labels, anchors, locations
 
 
 # ==================== PyTorch Dataset ====================
 
 class URLDataset(Dataset):
-    """Custom dataset for URL classification"""
+    """
+    *** UPDATED: Custom dataset now includes location_id ***
+    """
     
     def __init__(
         self,
         urls: List[str],
         labels: np.ndarray,
         tabular_features: np.ndarray,
+        location_ids: np.ndarray, # *** NEW ***
         tokenizer,
         max_length: int
     ):
         self.urls = urls
         self.labels = labels
         self.tabular_features = tabular_features
+        self.location_ids = location_ids # *** NEW ***
         self.tokenizer = tokenizer
         self.max_length = max_length
     
@@ -438,16 +513,41 @@ class URLDataset(Dataset):
             'input_ids': encoding['input_ids'].squeeze(0),
             'attention_mask': encoding['attention_mask'].squeeze(0),
             'tabular_features': torch.tensor(self.tabular_features[idx], dtype=torch.float32),
+            'location_id': torch.tensor(self.location_ids[idx], dtype=torch.long), # *** NEW ***
             'labels': torch.tensor(self.labels[idx], dtype=torch.long)
         }
+
+# ==================== Focal Loss ====================
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for multiclass classification.
+    """
+    def __init__(self, gamma: float = 2.0, reduction: str = 'mean'):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt)**self.gamma * ce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
 
 # ==================== Two-Tower Model ====================
 
 class TwoTowerURLClassifier(nn.Module):
     """
-    Two-Tower architecture:
+    *** UPDATED: Two-Tower architecture with Location Embedding ***
     - Tower 1: Fine-tunable URLBERT (Transformer)
-    - Tower 2: Tabular features MLP
+    - Tower 2: Tabular features MLP + Location Embedding
     - Fusion: Concatenation + Classification head
     """
     
@@ -455,7 +555,8 @@ class TwoTowerURLClassifier(nn.Module):
         self,
         config: E2EConfig,
         n_classes: int,
-        tabular_input_dim: int
+        tabular_input_dim: int,
+        n_locations: int # *** NEW ***
     ):
         super().__init__()
         self.config = config
@@ -465,7 +566,8 @@ class TwoTowerURLClassifier(nn.Module):
         self.urlbert_config = self.urlbert.config
         self.transformer_dim = self.urlbert_config.hidden_size
         
-        # Tower 2: Tabular features MLP
+        # Tower 2: Tabular features
+        # Part A: MLP for continuous features
         self.tabular_tower = nn.Sequential(
             nn.Linear(tabular_input_dim, config.tabular_hidden_dim),
             nn.ReLU(),
@@ -475,32 +577,59 @@ class TwoTowerURLClassifier(nn.Module):
             nn.Dropout(config.tabular_dropout)
         )
         
+        # Part B: Embedding for discrete 'location' feature
+        self.location_embedding = nn.Embedding(
+            n_locations, 
+            config.location_embed_dim
+        )
+        
         # Fusion and Classification Head
-        fusion_dim = self.transformer_dim + config.tabular_output_dim
+        # fusion_dim now includes location_embed_dim 
+        fusion_dim = (
+            self.transformer_dim + 
+            config.tabular_output_dim + 
+            config.location_embed_dim
+        )
+        
         self.classifier = nn.Sequential(
             nn.Dropout(config.fusion_dropout),
             nn.Linear(fusion_dim, n_classes)
         )
     
+    def _mean_pooling(self, last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Helper function for Attention-Masked Mean Pooling"""
+        mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+        sum_hidden = torch.sum(last_hidden_state * mask, dim=1)
+        sum_mask = torch.clamp(mask.sum(dim=1), min=1e-9)
+        return sum_hidden / sum_mask
+
     def forward(
         self,
         input_ids,
         attention_mask,
-        tabular_features
+        tabular_features,
+        location_id
     ):
-        # Tower 1: URLBERT embeddings
+        # Tower 1: URLBERT embeddings (Mean Pooling)
         transformer_outputs = self.urlbert(
             input_ids=input_ids,
             attention_mask=attention_mask
         )
-        
-        # Use [CLS] token (first token)
-        transformer_embedding = transformer_outputs.last_hidden_state[:, 0, :]
+        transformer_embedding = self._mean_pooling(
+            transformer_outputs.last_hidden_state,
+            attention_mask
+        )
         
         # Tower 2: Tabular embeddings
-        tabular_embedding = self.tabular_tower(tabular_features)
+        # Part A: MLP output
+        tabular_mlp_embedding = self.tabular_tower(tabular_features)
+        # Part B: Location output
+        location_embed = self.location_embedding(location_id)
         
-        # Fusion: Concatenate
+        # Combine Tower 2 outputs 
+        tabular_embedding = torch.cat([tabular_mlp_embedding, location_embed], dim=1)
+        
+        # Fusion: Concatenate Tower 1 and Tower 2
         fused = torch.cat([transformer_embedding, tabular_embedding], dim=1)
         
         # Classification
@@ -517,7 +646,7 @@ class E2ETrainer:
     def __init__(self, config: Optional[E2EConfig] = None):
         self.config = config or E2EConfig()
         self.fe = FeatureExtractor(self.config)
-        self.le = LabelEncoder()
+        self.le = LabelEncoder() # For labels
         self.model = None
         self.tokenizer = None
         self.device = torch.device(
@@ -533,12 +662,12 @@ class E2ETrainer:
         """Train with K-fold CV"""
         if self.config.verbose > 0:
             logger.info("="*60)
-            logger.info("Training Two-Tower E2E Classifier")
+            logger.info("Training Two-Tower E2E Classifier (with Anchor/Location)")
             logger.info("="*60)
             logger.info(f"Device: {self.device}")
         
         # Load data
-        urls, labels = DataProcessor.load_and_clean(
+        urls, labels, anchors, locations = DataProcessor.load_and_clean(
             json_file,
             self.fe.normalizer,
             self.config.remove_duplicates,
@@ -555,13 +684,19 @@ class E2ETrainer:
         
         # Extract tabular features
         if self.config.verbose > 0:
-            logger.info("\nExtracting tabular features...")
-        X_tabular = self.fe.extract_all_tabular_features(urls, fit=True)
+            logger.info("\nExtracting tabular features (Structural, Interaction, TF-IDF)...")
+        
+        # Fit FeatureExtractor and get both feature sets 
+        X_tabular, location_ids = self.fe.extract_all_tabular_features(
+            urls, anchors, locations, fit=True
+        )
         tabular_dim = X_tabular.shape[1]
+        n_locations = len(self.fe.le_location.classes_)
         
         if self.config.verbose > 0:
-            logger.info(f"Tabular feature dimension: {tabular_dim}")
-        
+            logger.info(f"Tabular (MLP) feature dimension: {tabular_dim}")
+            logger.info(f"Location (Embedding) classes: {n_locations}")
+
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.config.urlbert_model_name,
@@ -585,20 +720,21 @@ class E2ETrainer:
             urls_val = [urls[i] for i in idx_val]
             y_train, y_val = y[idx_tr], y[idx_val]
             X_tab_train, X_tab_val = X_tabular[idx_tr], X_tabular[idx_val]
+            loc_ids_train, loc_ids_val = location_ids[idx_tr], location_ids[idx_val]
             
             # Create datasets
             train_dataset = URLDataset(
-                urls_train, y_train, X_tab_train,
+                urls_train, y_train, X_tab_train, loc_ids_train,
                 self.tokenizer, self.config.urlbert_max_length
             )
             val_dataset = URLDataset(
-                urls_val, y_val, X_tab_val,
+                urls_val, y_val, X_tab_val, loc_ids_val,
                 self.tokenizer, self.config.urlbert_max_length
             )
             
             # Train model for this fold
             fold_acc, fold_f1 = self._train_fold(
-                train_dataset, val_dataset, n_classes, tabular_dim
+                train_dataset, val_dataset, n_classes, tabular_dim, n_locations
             )
             
             fold_results.append({'fold': fold, 'accuracy': fold_acc, 'f1': fold_f1})
@@ -620,10 +756,12 @@ class E2ETrainer:
             logger.info("\nTraining final model on full dataset...")
         
         full_dataset = URLDataset(
-            urls, y, X_tabular,
+            urls, y, X_tabular, location_ids,
             self.tokenizer, self.config.urlbert_max_length
         )
-        self.model = self._train_final_model(full_dataset, n_classes, tabular_dim)
+        self.model = self._train_final_model(
+            full_dataset, n_classes, tabular_dim, n_locations
+        )
         
         # Save
         if save_path:
@@ -648,12 +786,13 @@ class E2ETrainer:
         train_dataset: URLDataset,
         val_dataset: URLDataset,
         n_classes: int,
-        tabular_dim: int
+        tabular_dim: int,
+        n_locations: int
     ) -> Tuple[float, float]:
         """Train model for one fold"""
         # Create model
         model = TwoTowerURLClassifier(
-            self.config, n_classes, tabular_dim
+            self.config, n_classes, tabular_dim, n_locations
         ).to(self.device)
         
         # DataLoaders
@@ -673,7 +812,9 @@ class E2ETrainer:
         # Optimizer with differential learning rates
         optimizer = AdamW([
             {'params': model.urlbert.parameters(), 'lr': self.config.learning_rate},
+            # Add location_embedding to tabular LR group 
             {'params': model.tabular_tower.parameters(), 'lr': self.config.tabular_learning_rate},
+            {'params': model.location_embedding.parameters(), 'lr': self.config.tabular_learning_rate},
             {'params': model.classifier.parameters(), 'lr': self.config.tabular_learning_rate}
         ], weight_decay=self.config.weight_decay)
         
@@ -683,14 +824,28 @@ class E2ETrainer:
         
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=[self.config.learning_rate, self.config.tabular_learning_rate, self.config.tabular_learning_rate],
+            # Add LR for location_embedding 
+            max_lr=[
+                self.config.learning_rate, 
+                self.config.tabular_learning_rate, 
+                self.config.tabular_learning_rate, 
+                self.config.tabular_learning_rate
+            ],
             total_steps=total_steps,
             pct_start=warmup_steps/total_steps,
             anneal_strategy='cos'
         )
         
         # Loss function
-        criterion = nn.CrossEntropyLoss()
+        criterion: nn.Module
+        if self.config.use_focal_loss:
+            if self.config.verbose > 0:
+                logger.info(f"  Using Focal Loss (gamma={self.config.focal_loss_gamma})")
+            criterion = FocalLoss(gamma=self.config.focal_loss_gamma)
+        else:
+            if self.config.verbose > 0:
+                logger.info("  Using Cross Entropy Loss")
+            criterion = nn.CrossEntropyLoss()
         
         # Training loop
         best_val_acc = 0.0
@@ -704,11 +859,12 @@ class E2ETrainer:
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
                 tabular_features = batch['tabular_features'].to(self.device)
+                location_id = batch['location_id'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 
                 optimizer.zero_grad()
                 
-                logits = model(input_ids, attention_mask, tabular_features)
+                logits = model(input_ids, attention_mask, tabular_features, location_id)
                 loss = criterion(logits, labels)
                 
                 loss.backward()
@@ -745,11 +901,12 @@ class E2ETrainer:
         self,
         full_dataset: URLDataset,
         n_classes: int,
-        tabular_dim: int
+        tabular_dim: int,
+        n_locations: int
     ) -> TwoTowerURLClassifier:
         """Train final model on full dataset"""
         model = TwoTowerURLClassifier(
-            self.config, n_classes, tabular_dim
+            self.config, n_classes, tabular_dim, n_locations
         ).to(self.device)
         
         train_loader = DataLoader(
@@ -762,6 +919,7 @@ class E2ETrainer:
         optimizer = AdamW([
             {'params': model.urlbert.parameters(), 'lr': self.config.learning_rate},
             {'params': model.tabular_tower.parameters(), 'lr': self.config.tabular_learning_rate},
+            {'params': model.location_embedding.parameters(), 'lr': self.config.tabular_learning_rate},
             {'params': model.classifier.parameters(), 'lr': self.config.tabular_learning_rate}
         ], weight_decay=self.config.weight_decay)
         
@@ -770,24 +928,41 @@ class E2ETrainer:
         
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=[self.config.learning_rate, self.config.tabular_learning_rate, self.config.tabular_learning_rate],
+            max_lr=[
+                self.config.learning_rate, 
+                self.config.tabular_learning_rate, 
+                self.config.tabular_learning_rate, 
+                self.config.tabular_learning_rate
+            ],
             total_steps=total_steps,
             pct_start=warmup_steps/total_steps,
             anneal_strategy='cos'
         )
         
-        criterion = nn.CrossEntropyLoss()
+        criterion: nn.Module
+        if self.config.use_focal_loss:
+            if self.config.verbose > 0:
+                logger.info(f"  Using Focal Loss (gamma={self.config.focal_loss_gamma})")
+            criterion = FocalLoss(gamma=self.config.focal_loss_gamma)
+        else:
+            if self.config.verbose > 0:
+                logger.info("  Using Cross Entropy Loss")
+            criterion = nn.CrossEntropyLoss()
         
         model.train()
         for epoch in range(self.config.num_epochs):
+            if self.config.verbose > 1 and epoch % 5 == 0:
+                 logger.info(f"  Final training epoch {epoch+1}/{self.config.num_epochs}")
+                 
             for batch in train_loader:
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
                 tabular_features = batch['tabular_features'].to(self.device)
+                location_id = batch['location_id'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 
                 optimizer.zero_grad()
-                logits = model(input_ids, attention_mask, tabular_features)
+                logits = model(input_ids, attention_mask, tabular_features, location_id)
                 loss = criterion(logits, labels)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), self.config.gradient_clip)
@@ -811,9 +986,10 @@ class E2ETrainer:
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
                 tabular_features = batch['tabular_features'].to(self.device)
+                location_id = batch['location_id'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 
-                logits = model(input_ids, attention_mask, tabular_features)
+                logits = model(input_ids, attention_mask, tabular_features, location_id)
                 preds = torch.argmax(logits, dim=1)
                 
                 all_preds.extend(preds.cpu().numpy())
@@ -839,7 +1015,8 @@ class E2ETrainer:
             'label_encoder': self.le,
             'feature_extractor': self.fe,
             'n_classes': len(self.le.classes_),
-            'tabular_dim': self.fe.scaler.n_features_in_
+            'tabular_dim': self.fe.scaler.n_features_in_,
+            'n_locations': len(self.fe.le_location.classes_)
         }, filepath)
         
         if self.config.verbose > 0:
@@ -864,7 +1041,8 @@ class E2ETrainer:
         trainer.model = TwoTowerURLClassifier(
             config,
             checkpoint['n_classes'],
-            checkpoint['tabular_dim']
+            checkpoint['tabular_dim'],
+            checkpoint['n_locations']
         )
         trainer.model.load_state_dict(checkpoint['model_state_dict'])
         trainer.model.to(trainer.device)
@@ -888,6 +1066,7 @@ def main():
         urlbert_model_name="CrabInHoney/urlbert-tiny-base-v4",
         use_tfidf=True,
         tfidf_dim=256,
+        location_embed_dim=16,
         tabular_hidden_dim=128,
         tabular_output_dim=64,
         batch_size=32,
@@ -895,6 +1074,8 @@ def main():
         tabular_learning_rate=1e-3,
         num_epochs=10,
         n_folds=5,
+        use_focal_loss=True,
+        focal_loss_gamma=2.0,
         verbose=1
     )
     
