@@ -224,9 +224,6 @@ PRODUCT_KEYWORDS.update({'产品', 'Produkt', 'prodotto'})
 9. ends_with_number
 10. is_root
 
-## Files Added
-- `optimized_features.py` - Feature extractor implementation
-- `FEATURE_DESIGN.md` - Full design doc with data analysis
 
 ## Next Steps (potential)
 - SHAP-based feature selection (47→20 core features)
